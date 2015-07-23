@@ -108,9 +108,19 @@ def get_user_cache_dir():
 
 def boto_tree_hash(filename):
     fileobj = open(filename, 'rb')
-    linear_hash, tree_hash = compute_hashes_from_fileobj(fileobj)
+    _, tree_hash = compute_hashes_from_fileobj(fileobj)
     fileobj.close()
     return os.path.basename(filename), tree_hash
+
+
+def list_files(root):
+    # List files under a root, recursing into subdirectories
+    # Skips all hidden files and all contents of hidden subdirectories
+    files_l = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d[0] == '.']
+        files_l += [os.path.join(base, f) for f in files if not f[0] == '.']
+    return files_l
 
 
 class Cache(object):
@@ -185,7 +195,7 @@ class Cache(object):
             result = self._get_archive_query_by_ref(vault, ref).one()
         except sqlalchemy.orm.exc.NoResultFound:
             raise KeyError(ref)
-        except MultipleReMultipleResultsFound:
+        except MultipleResultsFound:
             raise MultipleResultsFound(ref)
         return result
 
@@ -248,11 +258,18 @@ class Cache(object):
                 "%s" % archive.name,
                 ])
 
+    def get_archive_list_with_ids_hash(self, vault):
+        for archive in self._get_archive_list_objects(vault):
+            yield "\t".join([
+                self._archive_ref(archive, force_id=True),
+                "%s" % archive.hash, "%s" % archive.name,
+                ])
+
     # TODO: Add checksum support
     def mark_seen_upstream(
             self, vault, id, name, upstream_creation_date,
             upstream_inventory_date, upstream_inventory_job_creation_date,
-            fix=False):
+            upstream_hash, fix=False):
 
         # Inventories don't get recreated unless the vault has changed.
         # See: https://forums.aws.amazon.com/thread.jspa?threadID=106541
@@ -288,7 +305,7 @@ class Cache(object):
             self.session.add(
                 self.Archive(
                     key=self.key, vault=vault, name=name, id=id,
-                    last_seen_upstream=last_seen_upstream
+                    last_seen_upstream=last_seen_upstream, hash=upstream_hash
                     )
                 )
         else:
@@ -302,6 +319,7 @@ class Cache(object):
                 else:
                     warn('archive %r appears to have changed name from %r ' %
                          (archive.id, archive.name) + 'to %r' % (name))
+            # TODO: Compare archive.hash to hash
             if archive.deleted_here:
                 archive_ref = self._archive_ref(archive)
                 if archive.deleted_here < upstream_inventory_date:
@@ -312,7 +330,7 @@ class Cache(object):
                          archive_ref)
             archive.last_seen_upstream = last_seen_upstream
 
-    # TODO: Add checksum support
+    # TODO: Add checksum support?
     def mark_only_seen(self, vault, inventory_date, ids, fix=False):
         upstream_ids = set(ids)
         our_ids = set([r[0] for r in
@@ -455,7 +473,7 @@ class App(object):
             id = archive['ArchiveId']
             name = archive['ArchiveDescription']
             creation_date = iso8601_to_unix_timestamp(archive['CreationDate'])
-            # TODO: Add checksum support and persist it in db if fix is set
+            hash = archive['SHA256TreeHash']
             self.cache.mark_seen_upstream(
                 vault=vault.name,
                 id=id,
@@ -463,6 +481,7 @@ class App(object):
                 upstream_creation_date=creation_date,
                 upstream_inventory_date=inventory_date,
                 upstream_inventory_job_creation_date=job_creation_date,
+                upstream_hash=hash,
                 fix=fix)
             seen_ids.append(id)
         self.cache.mark_only_seen(vault.name, inventory_date, seen_ids,
@@ -481,8 +500,8 @@ class App(object):
             if wait:
                 complete_job = wait_until_job_completed(inventory_jobs)
             else:
-                raise RetryConsoleError('job still pending for inventory on %r' %
-                                        vault.name)
+                raise RetryConsoleError('job still pending for inventory on '
+                                        '%s' % vault.name)
         else:
             job_id = vault.retrieve_inventory()
             job = vault.get_job(job_id)
@@ -490,8 +509,8 @@ class App(object):
                 wait_until_job_completed([job])
                 self._vault_sync_reconcile(vault, job, fix=fix)
             else:
-                raise RetryConsoleError('queued inventory job for %r' %
-                        vault.name)
+                raise RetryConsoleError('queued inventory job for %s' %
+                                        vault.name)
 
     def vault_sync(self):
         return self._vault_sync(vault_name=self.args.name,
@@ -499,43 +518,31 @@ class App(object):
                                 fix=self.args.fix,
                                 wait=self.args.wait)
 
-    def _cache_to_disk_reconcile(self, filenames=None):
-        # Report any archive in cache/glacier but not on disk
-        # Improper invocation *would* result in loss of data, so report only
-        names = [os.path.basename(f) for f in filenames if os.path.isfile(f)]
-        archive_list = list(self.cache.get_archive_list(self.args.vault))
-        diff_list = set(archive_list) - set(names)
-        if diff_list:
-            warn('Following files are in cache/glacier but not on disk:')
-            print(*diff_list, sep="\n", file=sys.stderr)
 
     def vault_reconcile(self):
         # Reconciles a vault cache against a local directory
         # only prints a report of changes unless --commit is specified
         delete_l, upload_l = [], []
-        for filename in self.args.names:
-            if not os.path.isfile(filename):
-                continue;
+        filenames = list_files(self.args.directory)
+        for filename in filenames:
             name = os.path.basename(filename)
             try:
                 archive = self.cache.get_archive(self.args.vault, name)
             except KeyError:
                 # This is a new archive and must be uploaded
-                debug('local archive not found in cache: %r' % name)
+                debug('local archive not found in cache: %s' % name)
                 upload_l.append(filename)
-                continue;
+                continue
             except MultipleResultsFound:
-                raise ConsoleError('Multiple cache records found for %r. '
-                                   'Abort' % name)
+                raise ConsoleError('Multiple cache records found for %s. '
+                                   'Aborting.' % name)
             with open(filename, 'rb') as fileobj:
-                linear_hash, tree_hash = compute_hashes_from_fileobj(fileobj)
+                _, tree_hash = compute_hashes_from_fileobj(fileobj)
                 if archive.hash != tree_hash:
                     # This is a modified file: delete it then upload it
-                    debug('local archive hash differs from cache: %r' % name)
+                    debug('local archive hash differs from cache: %s' % name)
                     delete_l.append(name)
                     upload_l.append(filename)
-                #else:
-                #    debug('Local archive %r hash matches cache' % name)
 
         self._print_reconcile_summary(delete_l, upload_l)
         if self.args.commit:
@@ -543,14 +550,13 @@ class App(object):
             self.archive_multi_upload(filenames=upload_l)
         else:
             info('use --commit to perform these changes')
-
-        self._cache_to_disk_reconcile(self.args.names)
+        self._cache_to_disk_reconcile(filenames)
 
     def vault_reconcile_p(self):
         # Reconciles a vault cache against a local directory, threaded version
         # only prints a report of changes unless --commit is passed
         delete_l, upload_l = [], []
-        filenames = [f for f in self.args.names if os.path.isfile(f)]
+        filenames = list_files(self.args.directory)
         # || compute hashes for each file and store as: {name: hash}
         info('Computing checksums for %i files. Please wait' % len(filenames))
         p = Pool(4)
@@ -561,19 +567,18 @@ class App(object):
                 archive = self.cache.get_archive(self.args.vault, name)
             except KeyError:
                 # This is a new archive and must be uploaded
-                debug('local archive not found in cache: %r' % name)
+                debug('local archive not found in cache: %s' % name)
                 upload_l.append(filename)
-                continue;
+                continue
             except MultipleResultsFound:
-                raise ConsoleError('Multiple cache records found for %r. '
-                                   'Abort' % name)
+                # note: we could look for the archive by checksum here
+                raise ConsoleError('Multiple cache records found for %s. '
+                                   'Aborting.' % name)
             if archive.hash != hash_dict.get(name):
                 # This is a modified file: delete it then upload it
-                debug('local archive hash differs from cache: %r' % name)
+                debug('local archive hash differs from cache: %s' % name)
                 delete_l.append(name)
                 upload_l.append(filename)
-            #else:
-            #    debug('Local archive %r hash matches cache' % name)
 
         self._print_reconcile_summary(delete_l, upload_l)
         if self.args.commit:
@@ -581,8 +586,7 @@ class App(object):
             self.archive_multi_upload(filenames=upload_l)
         else:
             info('use --commit to perform these changes')
-
-        self._cache_to_disk_reconcile(self.args.names)
+        self._cache_to_disk_reconcile(filenames)
 
     def _print_reconcile_summary(self, delete_l, upload_l):
         info('Reconciliation summary:\nDelete:')
@@ -590,10 +594,24 @@ class App(object):
         info('Upload:')
         print(*upload_l, sep="\n", file=sys.stderr)
 
+    def _cache_to_disk_reconcile(self, filenames):
+        # Report any archive in cache/glacier but not on disk
+        # Improper invocation *would* result in loss of data, so report only
+        # Use archive multi-delete to manually delete results reported here
+        names = set([os.path.basename(f) for f in filenames])
+        archives = set(self.cache.get_archive_list(self.args.vault))
+        diff = archives - names
+        if diff:
+            warn('Following files are in cache/glacier but not on disk:')
+            print(*diff, sep="\n", file=sys.stderr)
+
 
     def archive_list(self):
         if self.args.force_ids:
             archive_list = list(self.cache.get_archive_list_with_ids(
+                self.args.vault))
+        elif self.args.with_hash:
+            archive_list = list(self.cache.get_archive_list_with_ids_hash(
                 self.args.vault))
         else:
             archive_list = list(self.cache.get_archive_list(self.args.vault))
@@ -623,22 +641,16 @@ class App(object):
         self.cache.add_archive(self.args.vault, name, archive_id, tree_hash)
 
     def archive_multi_upload(self, filenames=None):
-        # Upload multiple files
-        # self.args.names is a list of filenames when called from cli
-        # custom naming is not supported; filename is used for description
-        #
-        # does not use multipart upload to get around:
+        # Upload multiple files - does not use multipart upload to get around:
         # https://github.com/boto/boto/issues/2209
         count = 0
         vault = self.connection.get_vault(self.args.vault)
         if filenames is None:
-            filenames = self.args.names
+            filenames = list_files(self.args.directory)
         for filename in filenames:
-            if not os.path.isfile(filename):
-                continue;
             with open(filename, 'rb') as fileobj:
                 name = os.path.basename(filename)
-                info('Uploading archive %r' % name )
+                info('Uploading archive %s' % name )
                 linear_hash, tree_hash = compute_hashes_from_fileobj(fileobj)
                 fileobj.seek(0)
                 response = vault.layer1.upload_archive(vault.name,
@@ -741,20 +753,22 @@ class App(object):
         vault.delete_archive(archive_id)
         self.cache.delete_archive(self.args.vault, self.args.name)
 
-    def _archive_multi_delete(self, names=None):
+    def archive_multi_delete(self, names=None):
         # Delete multiple files based on their names
         # called from vault_local_reconcile
         # Duplicate code from archive_delete instead of refactoring
         # names contain a list of archive names
         count = 0
         vault = self.connection.get_vault(self.args.vault)
+        if names is None:
+            names = self.args.names;
         for name in names:
             try:
                 archive_id = self.cache.get_archive_id(
                     self.args.vault, name)
             except KeyError:
-                raise ConsoleError('archive %r not found' % name)
-            info('Deleting archive %r' % name )
+                raise ConsoleError('archive %s not found' % name)
+            info('Deleting archive %s' % name )
             vault.delete_archive(archive_id)
             self.cache.delete_archive(self.args.vault, name)
             count += 1
@@ -829,19 +843,18 @@ class App(object):
         vault_recon_subparser = vault_subparser.add_parser('reconcile')
         vault_recon_subparser.set_defaults(func=self.vault_reconcile)
         vault_recon_subparser.add_argument('vault')
-        vault_recon_subparser.add_argument('names', nargs='+',
-                                             metavar='filename')
+        vault_recon_subparser.add_argument('directory')
         vault_recon_subparser.add_argument('--commit', action='store_true')
         vault_recon_p_subparser = vault_subparser.add_parser('reconcile-p')
         vault_recon_p_subparser.set_defaults(func=self.vault_reconcile_p)
         vault_recon_p_subparser.add_argument('vault')
-        vault_recon_p_subparser.add_argument('names', nargs='+',
-                                             metavar='filename')
+        vault_recon_p_subparser.add_argument('directory')
         vault_recon_p_subparser.add_argument('--commit', action='store_true')
         archive_subparser = subparsers.add_parser('archive').add_subparsers()
         archive_list_subparser = archive_subparser.add_parser('list')
         archive_list_subparser.set_defaults(func=self.archive_list)
         archive_list_subparser.add_argument('--force-ids', action='store_true')
+        archive_list_subparser.add_argument('--with-hash', action='store_true')
         archive_list_subparser.add_argument('vault')
         archive_upload_subparser = archive_subparser.add_parser('upload')
         archive_upload_subparser.set_defaults(func=self.archive_upload)
@@ -852,8 +865,7 @@ class App(object):
         archive_multi_subparser = archive_subparser.add_parser('multi-upload')
         archive_multi_subparser.set_defaults(func=self.archive_multi_upload)
         archive_multi_subparser.add_argument('vault')
-        archive_multi_subparser.add_argument('names', nargs='+',
-                                             metavar='filename')
+        archive_multi_subparser.add_argument('directory')
         archive_retrieve_subparser = archive_subparser.add_parser('retrieve')
         archive_retrieve_subparser.set_defaults(func=self.archive_retrieve)
         archive_retrieve_subparser.add_argument('vault')
@@ -868,6 +880,11 @@ class App(object):
         archive_delete_subparser.set_defaults(func=self.archive_delete)
         archive_delete_subparser.add_argument('vault')
         archive_delete_subparser.add_argument('name')
+        archive_multid_subparser = archive_subparser.add_parser('multi-delete')
+        archive_multid_subparser.set_defaults(func=self.archive_multi_delete)
+        archive_multid_subparser.add_argument('vault')
+        archive_multid_subparser.add_argument('names', nargs="+",
+                                              metavar='archive name or id')
         archive_checkpresent_subparser = archive_subparser.add_parser(
                 'checkpresent')
         archive_checkpresent_subparser.set_defaults(
@@ -880,7 +897,6 @@ class App(object):
                                                     action='store_true')
         archive_checkpresent_subparser.add_argument(
                 '--max-age', type=int, default=80, dest='max_age_hours')
-
         job_subparser = subparsers.add_parser('job').add_subparsers()
         job_subparser.add_parser('list').set_defaults(func=self.job_list)
         return parser.parse_args(args)

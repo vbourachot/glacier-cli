@@ -1,13 +1,15 @@
 glacier-cli
 ===========
 
-Fork of glacier-cli modified for: uploading timemachine/clonezilla backups to glacier for offsite backup.
+Fork of glacier-cli modified for uploading timemachine/clonezilla backups to glacier for offsite backup.
 
 Background
 ----------
-Timemachine backups are saved in sparsebundle images, which are saved on disk as encrypted 8MB chunks - clonezilla can be configured to produce similar output.
+Timemachine backups are saved in sparsebundle images, which are saved on disk as (encrypted) 8MB chunks - clonezilla can be configured to produce similar output.
 
-Timemachine will overwrite (possibly delete?) existing chunks when data changes. Relying on local last modified time to identify such changes is iffy at best. Relying on checksums is much safer.
+Timemachine will overwrite (possibly delete?) existing chunks when data changes. Relying on local last modified time to identify such changes would be iffy at best; relying on checksums is much safer. Luckily, glacier uses hashes in order to guarantee data integrity on upload, and these hashes are persisted and accessible throughout the lifecycle of each archive.
+
+This is basically the sole purpose of this fork - be aware of glacier hashes and rely on them as checksums for all local vs remote reconciliation operations.
 
 Changes in this fork
 --------------------
@@ -15,24 +17,24 @@ Changes in this fork
 - Use these checksums when comparing local vs remote (cached) files
 - Reconcile filesystem changes vs cache, and automatically update/upload modified/new files
 - Support uploading/deleting multiple files
-- TODO: Incorporate checksums in exisitng sync operation (cache rebuild)
-- TODO: Test - this is barely alpha at this point
+- Incorporate checksums in exisitng sync operation (cache rebuild)
+- TODO: Test - this is alpha at this point
 
 Example
 -------
-     $ ./glacier.py archive multi-upload example-vault /local/dir/* [...]
-_(Uploads all files specified to the vault. Note: no recursion in subdirectories)_
+     $ ./glacier.py archive multi-upload example-vault /local/dir
+_(Uploads all files in dir and its subdirectories to example-vault)_
 
-     $ ./glacier.py vault reconcile example-vault /local/dir/* [...]
+     $ ./glacier.py vault reconcile example-vault /local/dir
      or
-     $ ./glacier.py vault reconcile-p example-vault /local/dir/* [...]
-_(Reconciles local files against cached files for example-vault. Automatically update cache/glacier to reflect local changes. reconcile-p is the multithreaded version)_
+     $ ./glacier.py vault reconcile-p example-vault /local/dir
+_(Reconciles local files under dir against cached files for example-vault. Automatically update cache/glacier to reflect local changes if --commit is specified. reconcile-p is the multithreaded version)_
 
 Notes
 -----
 - I am not using or testing with git-annex - this fork might break integration.
-- Within my use case, I am hoping I will never have to pull this data from glacier. As a result, retrieval is not a priority. Any glacier interface should be able to pull the archives. The only requirement is that the archives must be renamed with their description when saved locally; this shouldn't be an extraordinary requirement.
-- TM default settings update the backups every hour. TM must be turned off while uploading/syncing to guarantee that the remote archive is in a consistent state.
+- For my use case, I am hoping I will never have to pull this data from glacier so retrieval is not a priority. Any glacier client (including this one) should be able to pull the archives. The only requirement is that the archives must be renamed with their description when saved locally (this client does so).
+- TM default settings update backups every hour. TM must be turned off while uploading/syncing to guarantee that the remote archive is in a consistent state.
 
 Original readme
 ---------------
