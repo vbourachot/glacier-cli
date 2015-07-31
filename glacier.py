@@ -39,8 +39,13 @@ import iso8601
 import sqlalchemy
 import sqlalchemy.ext.declarative
 import sqlalchemy.orm
-from sqlalchemy.orm.exc import MultipleResultsFound
-from multiprocessing import Pool
+
+import hashlib
+import binascii
+import multiprocessing
+import threading
+import Queue
+import operator
 
 # There is a lag between an archive being created and the archive
 # appearing on an inventory. Even if the inventory has an InventoryDate
@@ -106,16 +111,75 @@ def get_user_cache_dir():
     return os.path.join(home, '.cache')
 
 
-def boto_tree_hash(filename):
+class Sha256Consumer(threading.Thread):
+    """sha256 worker class"""
+    def __init__(self, queue, chunks_tup):
+        threading.Thread.__init__(self)
+        self._queue = queue
+        self._chunks_tup = chunks_tup
+
+    def run(self):
+        while True:
+            (i, chunk) = self._queue.get()
+            if i is None:
+                break;
+            self._chunks_tup.append((i, hashlib.sha256(chunk).digest()))
+            self._queue.task_done()
+
+def _sha256_producer(fileobj):
+    """Compute tree hash for fileobj
+    1 thread reads 1MB chunks from fileobj while thread_count threads hash
+    Tree hash computation is Based on boto.glacier.utils"""
+    chunks_tup, chunks = [], []
+    chunk_size = 1024 * 1024
+    thread_count = 2
+    queue = Queue.Queue(16)
+
+    # Start worker threads
+    for i in range(thread_count):
+        t = Sha256Consumer(queue, chunks_tup)
+        t.start()
+    # Read file and place chunks in queue for workers to hash
+    i = 0
+    for chunk in iter(lambda: fileobj.read(chunk_size), b''):
+        queue.put((i, chunk))
+        i += 1
+    queue.join()
+    # Stop worker threads
+    for i in range(thread_count):
+        queue.put((None, None))
+    if not chunks_tup:
+        return hashlib.sha256(b'').hexdigest()
+    # Sort and flatten chunks
+    chunks_tup.sort(key=operator.itemgetter(0))
+    chunks = map(operator.itemgetter(1), chunks_tup)
+    # Compute tree hash
+    while len(chunks) > 1:
+        new_chunks = []
+        while True:
+            if len(chunks) > 1:
+                first = chunks.pop(0)
+                second = chunks.pop(0)
+                new_chunks.append(hashlib.sha256(first + second).digest())
+            elif len(chunks) == 1:
+                only = chunks.pop(0)
+                new_chunks.append(only)
+            else:
+                break
+        chunks.extend(new_chunks)
+    return binascii.hexlify(chunks[0])
+
+def threaded_tree_hash(filename):
+    """Compute tree hash for filename"""
     fileobj = open(filename, 'rb')
-    _, tree_hash = compute_hashes_from_fileobj(fileobj)
+    tree_hash = _sha256_producer(fileobj)
     fileobj.close()
     return os.path.basename(filename), tree_hash
 
 
 def list_files(root):
-    # List files under a root, recursing into subdirectories
-    # Skips all hidden files and all contents of hidden subdirectories
+    """List files under a root, recursing into subdirectories
+    Skips all hidden files and all contents of hidden subdirectories"""
     files_l = []
     for base, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if not d[0] == '.']
@@ -195,15 +259,15 @@ class Cache(object):
             result = self._get_archive_query_by_ref(vault, ref).one()
         except sqlalchemy.orm.exc.NoResultFound:
             raise KeyError(ref)
-        except MultipleResultsFound:
-            raise MultipleResultsFound(ref)
+        except sqlalchemy.orm.exc.MultipleResultsFound:
+            raise sqlalchemy.orm.exc.MultipleResultsFound(ref)
         return result
 
     def delete_archive(self, vault, ref):
         try:
             result = self._get_archive_query_by_ref(vault, ref).one()
         except sqlalchemy.orm.exc.NoResultFound:
-            raise KeyError(name)
+            raise KeyError(ref)
         result.deleted_here = time.time()
         self.session.commit()
 
@@ -473,7 +537,7 @@ class App(object):
             id = archive['ArchiveId']
             name = archive['ArchiveDescription']
             creation_date = iso8601_to_unix_timestamp(archive['CreationDate'])
-            hash = archive['SHA256TreeHash']
+            hash_ = archive['SHA256TreeHash']
             self.cache.mark_seen_upstream(
                 vault=vault.name,
                 id=id,
@@ -481,7 +545,7 @@ class App(object):
                 upstream_creation_date=creation_date,
                 upstream_inventory_date=inventory_date,
                 upstream_inventory_job_creation_date=job_creation_date,
-                upstream_hash=hash,
+                upstream_hash=hash_,
                 fix=fix)
             seen_ids.append(id)
         self.cache.mark_only_seen(vault.name, inventory_date, seen_ids,
@@ -520,47 +584,14 @@ class App(object):
 
 
     def vault_reconcile(self):
-        # Reconciles a vault cache against a local directory
-        # only prints a report of changes unless --commit is specified
-        delete_l, upload_l = [], []
-        filenames = list_files(self.args.directory)
-        for filename in filenames:
-            name = os.path.basename(filename)
-            try:
-                archive = self.cache.get_archive(self.args.vault, name)
-            except KeyError:
-                # This is a new archive and must be uploaded
-                debug('local archive not found in cache: %s' % name)
-                upload_l.append(filename)
-                continue
-            except MultipleResultsFound:
-                raise ConsoleError('Multiple cache records found for %s. '
-                                   'Aborting.' % name)
-            with open(filename, 'rb') as fileobj:
-                _, tree_hash = compute_hashes_from_fileobj(fileobj)
-                if archive.hash != tree_hash:
-                    # This is a modified file: delete it then upload it
-                    debug('local archive hash differs from cache: %s' % name)
-                    delete_l.append(name)
-                    upload_l.append(filename)
-
-        self._print_reconcile_summary(delete_l, upload_l)
-        if self.args.commit:
-            self._archive_multi_delete(names=delete_l)
-            self.archive_multi_upload(filenames=upload_l)
-        else:
-            info('use --commit to perform these changes')
-        self._cache_to_disk_reconcile(filenames)
-
-    def vault_reconcile_p(self):
-        # Reconciles a vault cache against a local directory, threaded version
-        # only prints a report of changes unless --commit is passed
+        """Reconciles a vault cache against a local directory.
+        Only prints a report of changes unless --commit is passed"""
         delete_l, upload_l = [], []
         filenames = list_files(self.args.directory)
         # || compute hashes for each file and store as: {name: hash}
         info('Computing checksums for %i files. Please wait' % len(filenames))
-        p = Pool(4)
-        hash_dict = dict(p.map(boto_tree_hash, filenames))
+        p = multiprocessing.Pool(2)
+        hash_dict = dict(p.map(threaded_tree_hash, filenames))
         for filename in filenames:
             name = os.path.basename(filename)
             try:
@@ -570,7 +601,7 @@ class App(object):
                 debug('local archive not found in cache: %s' % name)
                 upload_l.append(filename)
                 continue
-            except MultipleResultsFound:
+            except sqlalchemy.orm.exc.MultipleResultsFound:
                 # note: we could look for the archive by checksum here
                 raise ConsoleError('Multiple cache records found for %s. '
                                    'Aborting.' % name)
@@ -582,22 +613,25 @@ class App(object):
 
         self._print_reconcile_summary(delete_l, upload_l)
         if self.args.commit:
-            self._archive_multi_delete(names=delete_l)
+            self.archive_multi_delete(names=delete_l)
             self.archive_multi_upload(filenames=upload_l)
-        else:
+        elif delete_l or upload_l:
             info('use --commit to perform these changes')
         self._cache_to_disk_reconcile(filenames)
 
     def _print_reconcile_summary(self, delete_l, upload_l):
+        if not delete_l and not upload_l:
+            info('Nothing to do')
+            return
         info('Reconciliation summary:\nDelete:')
         print(*delete_l, sep="\n", file=sys.stderr)
         info('Upload:')
         print(*upload_l, sep="\n", file=sys.stderr)
 
     def _cache_to_disk_reconcile(self, filenames):
-        # Report any archive in cache/glacier but not on disk
-        # Improper invocation *would* result in loss of data, so report only
-        # Use archive multi-delete to manually delete results reported here
+        """Report any archive in cache/glacier but not on disk
+        Improper invocation *would* result in loss of data, so report only
+        Use archive multi-delete to manually delete results reported here"""
         names = set([os.path.basename(f) for f in filenames])
         archives = set(self.cache.get_archive_list(self.args.vault))
         diff = archives - names
@@ -641,8 +675,8 @@ class App(object):
         self.cache.add_archive(self.args.vault, name, archive_id, tree_hash)
 
     def archive_multi_upload(self, filenames=None):
-        # Upload multiple files - does not use multipart upload to get around:
-        # https://github.com/boto/boto/issues/2209
+        """Upload multiple files - does not use multipart upload to get around:
+        https://github.com/boto/boto/issues/2209"""
         count = 0
         vault = self.connection.get_vault(self.args.vault)
         if filenames is None:
@@ -737,6 +771,12 @@ class App(object):
                 self.archive_retrieve_one(name)
             except RetryConsoleError as e:
                 retry_list.append(e.message)
+            # The call to retrieve an archive can fail due to data retrieval
+            # policy, which is raised as UnexpectedHttpResponse from boto.
+            # Catch this here, and exit gracefully after printing status
+            except boto.glacier.exceptions.UnexpectedHTTPResponseError as e:
+                info("\n".join(success_list + retry_list))
+                raise ConsoleError(e.message)
             else:
                 success_list.append('retrieved archive %r' % name)
         if retry_list:
@@ -754,21 +794,18 @@ class App(object):
         self.cache.delete_archive(self.args.vault, self.args.name)
 
     def archive_multi_delete(self, names=None):
-        # Delete multiple files based on their names
-        # called from vault_local_reconcile
-        # Duplicate code from archive_delete instead of refactoring
-        # names contain a list of archive names
+        """Delete multiple files based on their names or id
+        (duplicating code from archive_delete rather than refactoring)"""
         count = 0
         vault = self.connection.get_vault(self.args.vault)
         if names is None:
             names = self.args.names;
         for name in names:
             try:
-                archive_id = self.cache.get_archive_id(
-                    self.args.vault, name)
+                archive_id = self.cache.get_archive_id(self.args.vault, name)
             except KeyError:
                 raise ConsoleError('archive %s not found' % name)
-            info('Deleting archive %s' % name )
+            info('Deleting archive %s' % name)
             vault.delete_archive(archive_id)
             self.cache.delete_archive(self.args.vault, name)
             count += 1
@@ -845,11 +882,6 @@ class App(object):
         vault_recon_subparser.add_argument('vault')
         vault_recon_subparser.add_argument('directory')
         vault_recon_subparser.add_argument('--commit', action='store_true')
-        vault_recon_p_subparser = vault_subparser.add_parser('reconcile-p')
-        vault_recon_p_subparser.set_defaults(func=self.vault_reconcile_p)
-        vault_recon_p_subparser.add_argument('vault')
-        vault_recon_p_subparser.add_argument('directory')
-        vault_recon_p_subparser.add_argument('--commit', action='store_true')
         archive_subparser = subparsers.add_parser('archive').add_subparsers()
         archive_list_subparser = archive_subparser.add_parser('list')
         archive_list_subparser.set_defaults(func=self.archive_list)

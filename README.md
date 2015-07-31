@@ -18,7 +18,6 @@ Changes in this fork
 - Reconcile filesystem changes vs cache, and automatically update/upload modified/new files
 - Support uploading/deleting multiple files
 - Incorporate checksums in exisitng sync operation (cache rebuild)
-- TODO: Test - this is alpha at this point
 
 Example
 -------
@@ -26,9 +25,7 @@ Example
 _(Uploads all files in dir and its subdirectories to example-vault)_
 
      $ ./glacier.py vault reconcile example-vault /local/dir
-     or
-     $ ./glacier.py vault reconcile-p example-vault /local/dir
-_(Reconciles local files under dir against cached files for example-vault. Automatically update cache/glacier to reflect local changes if --commit is specified. reconcile-p is the multithreaded version)_
+_(Reconciles local files under dir against cached files for example-vault. Automatically update cache/glacier to reflect local changes if --commit is specified.)_
 
 Notes
 -----
