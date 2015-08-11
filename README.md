@@ -17,7 +17,7 @@ Changes in this fork
 - Use these checksums when comparing local vs remote (cached) files
 - Reconcile filesystem changes vs cache, and automatically update/upload modified/new files
 - Support uploading/deleting multiple files
-- Incorporate checksums in exisitng sync operation (cache rebuild)
+- Incorporate checksums in existing sync operation (cache rebuild)
 
 Example
 -------
@@ -32,6 +32,8 @@ Notes
 - I am not using or testing with git-annex - this fork might break integration.
 - For my use case, I am hoping I will never have to pull this data from glacier so retrieval is not a priority. Any glacier client (including this one) should be able to pull the archives. The only requirement is that the archives must be renamed with their description when saved locally (this client does so).
 - TM default settings update backups every hour. TM must be turned off while uploading/syncing to guarantee that the remote archive is in a consistent state.
+- Uploads can take a loooong time.. use tmux to reattach to the session and/or tee the output of multi-upload to a file, e.g: ``./glacier.py archive multi-upload example-vault /local/dir 2>&1 | tee -a ./upload.log``
+- If a multi-upload fails (due to connection errors for example), --resume can be used to only upload files not previously uploaded.
 
 Original readme
 ---------------

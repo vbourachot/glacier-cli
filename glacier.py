@@ -57,7 +57,7 @@ INVENTORY_LAG = 24 * 60 * 60 * 3
 
 PROGRAM_NAME = 'glacier'
 
-DEBUG = 1
+#DEBUG = 1
 
 class ConsoleError(RuntimeError):
     def __init__(self, m):
@@ -128,8 +128,7 @@ class Sha256Consumer(threading.Thread):
 
 def _sha256_producer(fileobj):
     """Compute tree hash for fileobj
-    1 thread reads 1MB chunks from fileobj while thread_count threads hash
-    Tree hash computation is Based on boto.glacier.utils"""
+    1 thread reads 1MB chunks from fileobj while thread_count threads hash"""
     chunks_tup, chunks = [], []
     chunk_size = 1024 * 1024
     thread_count = 2
@@ -153,21 +152,8 @@ def _sha256_producer(fileobj):
     # Sort and flatten chunks
     chunks_tup.sort(key=operator.itemgetter(0))
     chunks = map(operator.itemgetter(1), chunks_tup)
-    # Compute tree hash
-    while len(chunks) > 1:
-        new_chunks = []
-        while True:
-            if len(chunks) > 1:
-                first = chunks.pop(0)
-                second = chunks.pop(0)
-                new_chunks.append(hashlib.sha256(first + second).digest())
-            elif len(chunks) == 1:
-                only = chunks.pop(0)
-                new_chunks.append(only)
-            else:
-                break
-        chunks.extend(new_chunks)
-    return binascii.hexlify(chunks[0])
+    # assemble tree hash and return its hex value
+    return binascii.hexlify(boto.glacier.utils.tree_hash(chunks))
 
 def threaded_tree_hash(filename):
     """Compute tree hash for filename"""
@@ -681,16 +667,29 @@ class App(object):
         vault = self.connection.get_vault(self.args.vault)
         if filenames is None:
             filenames = list_files(self.args.directory)
+        if self.args.resume:
+            archives = list(self.cache.get_archive_list(self.args.vault))
         for filename in filenames:
+            if self.args.resume and os.path.basename(filename) in archives:
+                continue
             with open(filename, 'rb') as fileobj:
                 name = os.path.basename(filename)
-                info('Uploading archive %s' % name )
+                info('Uploading archive %s' % name)
                 linear_hash, tree_hash = compute_hashes_from_fileobj(fileobj)
                 fileobj.seek(0)
-                response = vault.layer1.upload_archive(vault.name,
-                                fileobj, linear_hash, tree_hash, name)
-                self.cache.add_archive(self.args.vault, name,
-                                       response['ArchiveId'], tree_hash)
+                for upload_attempt in range(5):
+                    try:
+                        response = vault.layer1.upload_archive(vault.name,
+                                    fileobj, linear_hash, tree_hash, name)
+                    except boto.glacier.exceptions.UnexpectedHTTPResponseError:
+                        warn('Upload failed - retrying for archive %s' % name)
+                        fileobj.seek(0)
+                    else:
+                        self.cache.add_archive(self.args.vault, name,
+                            response['ArchiveId'], tree_hash)
+                        break
+                else:
+                    raise ConsoleError('Failed upload for archive %s' % name)
                 count += 1
         info('%i archives uploaded' % count)
 
@@ -898,6 +897,7 @@ class App(object):
         archive_multi_subparser.set_defaults(func=self.archive_multi_upload)
         archive_multi_subparser.add_argument('vault')
         archive_multi_subparser.add_argument('directory')
+        archive_multi_subparser.add_argument('--resume', action='store_true')
         archive_retrieve_subparser = archive_subparser.add_parser('retrieve')
         archive_retrieve_subparser.set_defaults(func=self.archive_retrieve)
         archive_retrieve_subparser.add_argument('vault')
