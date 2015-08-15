@@ -308,6 +308,12 @@ class Cache(object):
                 "%s" % archive.name,
                 ])
 
+    def get_archive_list_with_hash(self, vault):
+        for archive in self._get_archive_list_objects(vault):
+            yield "\t".join([
+                self._archive_ref(archive, force_id=False),
+                "%s" % archive.hash, ])
+
     def get_archive_list_with_ids_hash(self, vault):
         for archive in self._get_archive_list_objects(vault):
             yield "\t".join([
@@ -352,6 +358,8 @@ class Cache(object):
             archive = self.session.query(self.Archive).filter_by(
                 key=self.key, vault=vault, id=id).one()
         except sqlalchemy.orm.exc.NoResultFound:
+            warn('archive %s (%s) present upstream but not in cache - added' %
+                 (name, id))
             self.session.add(
                 self.Archive(
                     key=self.key, vault=vault, name=name, id=id,
@@ -369,7 +377,9 @@ class Cache(object):
                 else:
                     warn('archive %r appears to have changed name from %r ' %
                          (archive.id, archive.name) + 'to %r' % (name))
-            # TODO: Compare archive.hash to hash
+            if archive.hash != upstream_hash:
+                warn('archive %s upstream hash does not match cache hash' %
+                     archive.name)
             if archive.deleted_here:
                 archive_ref = self._archive_ref(archive)
                 if archive.deleted_here < upstream_inventory_date:
@@ -380,7 +390,6 @@ class Cache(object):
                          archive_ref)
             archive.last_seen_upstream = last_seen_upstream
 
-    # TODO: Add checksum support?
     def mark_only_seen(self, vault, inventory_date, ids, fix=False):
         upstream_ids = set(ids)
         our_ids = set([r[0] for r in
@@ -628,10 +637,14 @@ class App(object):
 
     def archive_list(self):
         if self.args.force_ids:
-            archive_list = list(self.cache.get_archive_list_with_ids(
-                self.args.vault))
+            if self.args.with_hash:
+                archive_list = list(self.cache.get_archive_list_with_ids_hash(
+                    self.args.vault))
+            else:
+                archive_list = list(self.cache.get_archive_list_with_ids(
+                    self.args.vault))
         elif self.args.with_hash:
-            archive_list = list(self.cache.get_archive_list_with_ids_hash(
+            archive_list = list(self.cache.get_archive_list_with_hash(
                 self.args.vault))
         else:
             archive_list = list(self.cache.get_archive_list(self.args.vault))
@@ -664,26 +677,27 @@ class App(object):
         """Upload multiple files - does not use multipart upload to get around:
         https://github.com/boto/boto/issues/2209"""
         count = 0
+        resume = True if 'resume' in vars(self.args) and self.args.resume \
+                 else False;
         vault = self.connection.get_vault(self.args.vault)
         if filenames is None:
             filenames = list_files(self.args.directory)
-        if self.args.resume:
+        if resume:
             archives = list(self.cache.get_archive_list(self.args.vault))
         for filename in filenames:
-            if self.args.resume and os.path.basename(filename) in archives:
+            if resume and os.path.basename(filename) in archives:
                 continue
             with open(filename, 'rb') as fileobj:
                 name = os.path.basename(filename)
                 info('Uploading archive %s' % name)
                 linear_hash, tree_hash = compute_hashes_from_fileobj(fileobj)
-                fileobj.seek(0)
                 for upload_attempt in range(5):
                     try:
+                        fileobj.seek(0)
                         response = vault.layer1.upload_archive(vault.name,
                                     fileobj, linear_hash, tree_hash, name)
                     except boto.glacier.exceptions.UnexpectedHTTPResponseError:
                         warn('Upload failed - retrying for archive %s' % name)
-                        fileobj.seek(0)
                     else:
                         self.cache.add_archive(self.args.vault, name,
                             response['ArchiveId'], tree_hash)
